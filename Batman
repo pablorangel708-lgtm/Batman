@@ -1,0 +1,1854 @@
+--[[
+	🦇 BATMAN TACTICAL SYSTEM — LocalScript (Roblox / RP / Android)
+
+	INSTALAÇÃO: StarterPlayer > StarterPlayerScripts > novo LocalScript > cole este código.
+
+	- Todas as animações são procedurais (Motor6D.C0 + TweenService). Nenhum ID de animação.
+	- Tudo (animações, capa, cabos, batarangues, gel) é VISUAL e LOCAL: só você enxerga.
+	  Movimentos de Motor6D feitos no cliente não replicam para outros jogadores.
+	- Sons usam arquivos internos do cliente (rbxasset://sounds/...). Troque em CONFIG.Sounds
+	  por IDs seus, ou deixe "" para silenciar.
+	- Servidor é OPCIONAL (veja BatmanTacticalServer.server.lua): mostra a explosão do gel para
+	  os outros e quebra peças marcadas com a tag "BatmanBreakable".
+
+	CONTROLES (celular): botão 🦇 abre o painel. Botão grande de AÇÃO aparece ao equipar algo.
+	CONTROLES (PC): E = ação, Q = ação secundária, 1-6 = equipamentos.
+]]
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+local Lighting = game:GetService("Lighting")
+local Workspace = game:GetService("Workspace")
+local Debris = game:GetService("Debris")
+local SoundService = game:GetService("SoundService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+------------------------------------------------------------------------
+-- CONFIGURAÇÃO
+------------------------------------------------------------------------
+local CONFIG = {
+	GlideOnDoubleJump = true, -- com a capa ligada, pular de novo no ar abre a capa
+	HookRange = 130,
+	HookPullSpeed = 95,
+	HookCooldown = 1.6,
+	BatarangSpeed = 150,
+	BatarangRange = 170,
+	BatarangCooldown = 0.9,
+	GelMax = 3,
+	GelReach = 12,
+	GelCooldown = 1.0,
+	GpsRange = 200,
+	Sounds = {
+		Fire = "rbxasset://sounds/snap.mp3",
+		Throw = "rbxasset://sounds/swordslash.wav",
+		Draw = "rbxasset://sounds/unsheath.wav",
+		Click = "rbxasset://sounds/button.wav",
+		Beep = "rbxasset://sounds/electronicpingshort.wav",
+		Boom = "rbxasset://sounds/bass.wav",
+		Hit = "rbxasset://sounds/clickfast.wav",
+	},
+}
+
+local C = {
+	YEL = Color3.fromRGB(255, 208, 0),
+	BLK = Color3.fromRGB(10, 10, 12),
+	DARK = Color3.fromRGB(28, 29, 33),
+	MID = Color3.fromRGB(46, 48, 54),
+	LINE = Color3.fromRGB(74, 76, 84),
+	OFF = Color3.fromRGB(70, 72, 78),
+	LIT = Color3.fromRGB(215, 215, 220),
+	ON_BG = Color3.fromRGB(70, 60, 8),
+}
+
+------------------------------------------------------------------------
+-- LIMPEZA DE EXECUÇÕES ANTERIORES
+------------------------------------------------------------------------
+do
+	local old = playerGui:FindFirstChild("BatmanTacticalSystem")
+	if old then old:Destroy() end
+	local oldFx = Workspace:FindFirstChild("BTS_LocalFX")
+	if oldFx then oldFx:Destroy() end
+end
+local worldFx = Instance.new("Folder")
+worldFx.Name = "BTS_LocalFX"
+worldFx.Parent = Workspace
+
+------------------------------------------------------------------------
+-- UTILITÁRIOS
+------------------------------------------------------------------------
+local function clamp(x, a, b) return math.max(a, math.min(b, x)) end
+local function lerp(a, b, t) return a + (b - a) * t end
+local function RX(d) return CFrame.Angles(math.rad(d), 0, 0) end
+local function RY(d) return CFrame.Angles(0, math.rad(d), 0) end
+local function RZ(d) return CFrame.Angles(0, 0, math.rad(d)) end
+local ID = CFrame.new()
+
+local function create(class, props, parent)
+	local inst = Instance.new(class)
+	if props then
+		for k, v in pairs(props) do inst[k] = v end
+	end
+	if parent then inst.Parent = parent end
+	return inst
+end
+
+local function newPart(props, class)
+	local p = Instance.new(class or "Part")
+	p.Anchored = false
+	p.CanCollide = false
+	p.CanTouch = false
+	p.CanQuery = false
+	p.Massless = true
+	p.TopSurface = Enum.SurfaceType.Smooth
+	p.BottomSurface = Enum.SurfaceType.Smooth
+	p.Material = Enum.Material.SmoothPlastic
+	p.Color = C.DARK
+	if props then
+		for k, v in pairs(props) do p[k] = v end
+	end
+	return p
+end
+
+local function tw(inst, t, props, style, dir)
+	local tween = TweenService:Create(inst, TweenInfo.new(t, style or Enum.EasingStyle.Quad, dir or Enum.EasingDirection.Out), props)
+	tween:Play()
+	return tween
+end
+
+local function playSound(id, vol, speed)
+	if not id or id == "" then return end
+	pcall(function()
+		local s = Instance.new("Sound")
+		s.SoundId = id
+		s.Volume = vol or 0.7
+		s.PlaybackSpeed = speed or 1
+		s.Parent = SoundService
+		s:Play()
+		Debris:AddItem(s, 4)
+	end)
+end
+
+------------------------------------------------------------------------
+-- ESTADO GLOBAL
+------------------------------------------------------------------------
+local State = {
+	cape = false,
+	gps = false,
+	nv = false,
+	tool = nil, -- "hook" | "batarang" | "gel" | nil
+	glide = false,
+	busy = false,
+	airStart = 0,
+	cd = { hook = 0, batarang = 0, gel = 0 },
+}
+
+local toast = function(_) end
+local refreshUI = function() end
+local flashAction = function(_) end
+
+------------------------------------------------------------------------
+-- RIG (articulações originais guardadas e restauradas)
+------------------------------------------------------------------------
+local Rig = {
+	alive = false, char = nil, hum = nil, hrp = nil, torso = nil,
+	rHand = nil, lHand = nil, joints = {}, orig = {}, r15 = false,
+}
+
+local JOINT_NAMES = {
+	RS = { "RightShoulder", "Right Shoulder" },
+	LS = { "LeftShoulder", "Left Shoulder" },
+	RE = { "RightElbow" },
+	LE = { "LeftElbow" },
+	WA = { "Waist" },
+	NK = { "Neck" },
+	RJ = { "RootJoint" },
+}
+
+local function offsetC0(orig, off)
+	-- gira em torno do pivô da articulação, nos eixos do Part0 (funciona em R6 e R15)
+	return CFrame.new(orig.Position) * off * orig.Rotation
+end
+
+local function indexRig(char)
+	local joints, orig = {}, {}
+	for key, names in pairs(JOINT_NAMES) do
+		for _, n in ipairs(names) do
+			local m = char:FindFirstChild(n, true)
+			if m and m:IsA("Motor6D") then
+				joints[key] = m
+				orig[m] = m.C0
+				break
+			end
+		end
+	end
+	if not joints.WA and joints.RJ then joints.WA = joints.RJ end -- R6: cintura = raiz
+	Rig.joints, Rig.orig = joints, orig
+	return joints.RS ~= nil and joints.LS ~= nil and joints.RJ ~= nil
+end
+
+local function rayParams()
+	local p = RaycastParams.new()
+	p.FilterType = Enum.RaycastFilterType.Exclude
+	local list = { worldFx }
+	if Rig.char then table.insert(list, Rig.char) end
+	p.FilterDescendantsInstances = list
+	p.IgnoreWater = true
+	return p
+end
+
+------------------------------------------------------------------------
+-- MOTOR DE ANIMAÇÃO PROCEDURAL
+------------------------------------------------------------------------
+local Anim = { token = 0, tweens = {}, cleanups = {} }
+
+function Anim.cancel()
+	Anim.token = Anim.token + 1
+	for _, t in ipairs(Anim.tweens) do
+		pcall(function() t:Cancel() end)
+	end
+	table.clear(Anim.tweens)
+	local list = Anim.cleanups
+	Anim.cleanups = {}
+	for _, f in ipairs(list) do pcall(f) end
+	State.busy = false
+end
+
+function Anim.begin()
+	Anim.cancel()
+	return Anim.token
+end
+
+function Anim.addCleanup(f)
+	table.insert(Anim.cleanups, f)
+end
+
+-- Pose COMPLETA: qualquer articulação não citada volta à posição original.
+function Anim.pose(pose, dur, style, dir)
+	local offs = {}
+	for key, off in pairs(pose) do
+		local m = Rig.joints[key]
+		if m then
+			offs[m] = offs[m] and (offs[m] * off) or off
+		end
+	end
+	local seen = {}
+	for _, m in pairs(Rig.joints) do
+		if not seen[m] and m.Parent and Rig.orig[m] then
+			seen[m] = true
+			local goal = offsetC0(Rig.orig[m], offs[m] or ID)
+			if dur and dur > 0 then
+				local t = TweenService:Create(m, TweenInfo.new(dur, style or Enum.EasingStyle.Sine, dir or Enum.EasingDirection.InOut), { C0 = goal })
+				table.insert(Anim.tweens, t)
+				t:Play()
+			else
+				m.C0 = goal
+			end
+		end
+	end
+end
+
+function Anim.step(token, pose, dur, style, dir)
+	if token ~= Anim.token then return false end
+	Anim.pose(pose, dur, style, dir)
+	if dur and dur > 0 then task.wait(dur) end
+	return token == Anim.token
+end
+
+function Anim.hardReset()
+	for _, m in pairs(Rig.joints) do
+		pcall(function()
+			if Rig.orig[m] then m.C0 = Rig.orig[m] end
+		end)
+	end
+end
+
+local function runJob(fn)
+	if State.busy or not Rig.alive then return end
+	local token = Anim.begin()
+	State.busy = true
+	task.spawn(function()
+		local ok, err = pcall(fn, token)
+		if not ok then warn("[BatmanTacticalSystem] " .. tostring(err)) end
+		if token == Anim.token then State.busy = false end
+	end)
+end
+
+-- Poses
+local BELT = {
+	hook = { RS = RX(-14) * RZ(-4), RE = RX(30), WA = RY(-8) },
+	batarang = { RS = RX(8) * RZ(-24), RE = RX(60), WA = RY(-6) },
+	gel = { RS = RX(-18) * RZ(-6), RE = RX(26), WA = RY(-8) },
+}
+local HOLD = {
+	hook = { RS = RX(70) * RZ(-6), RE = RX(34), LS = RX(52) * RZ(24), LE = RX(50), WA = RY(-6) },
+	batarang = { RS = RX(36) * RZ(-14), RE = RX(64), LS = RX(14) * RZ(6), LE = RX(18), WA = RY(-4) },
+	gel = { RS = RX(62) * RZ(-6), RE = RX(30), LS = RX(40) * RZ(18), LE = RX(40), WA = RY(-4) },
+}
+
+------------------------------------------------------------------------
+-- EFEITOS VISUAIS (faíscas, explosão, tremor de câmera)
+------------------------------------------------------------------------
+local function sparks(pos, color, count)
+	local p = newPart({ Anchored = true, Transparency = 1, Size = Vector3.new(0.2, 0.2, 0.2), Position = pos, Parent = worldFx })
+	local e = create("ParticleEmitter", {
+		Rate = 0,
+		Lifetime = NumberRange.new(0.25, 0.55),
+		Speed = NumberRange.new(14, 32),
+		SpreadAngle = Vector2.new(180, 180),
+		Acceleration = Vector3.new(0, -50, 0),
+		Color = ColorSequence.new(color),
+		LightEmission = 1,
+		Size = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.28), NumberSequenceKeypoint.new(1, 0) }),
+	}, p)
+	e:Emit(count)
+	Debris:AddItem(p, 1.5)
+end
+
+local function shake(mag, dur)
+	local hum = Rig.hum
+	if not hum then return end
+	task.spawn(function()
+		local t0 = os.clock()
+		while hum.Parent do
+			local a = (os.clock() - t0) / dur
+			if a >= 1 then break end
+			local m = mag * (1 - a)
+			hum.CameraOffset = Vector3.new((math.random() - 0.5) * m, (math.random() - 0.5) * m, 0)
+			RunService.RenderStepped:Wait()
+		end
+		if hum.Parent then hum.CameraOffset = Vector3.zero end
+	end)
+end
+
+local function boom(pos, fromRemote)
+	-- Somente efeito visual local: sem dano, sem alterar o mapa.
+	local orange = Color3.fromRGB(255, 150, 30)
+	local core = newPart({ Shape = Enum.PartType.Ball, Anchored = true, Size = Vector3.new(1, 1, 1), Position = pos, Color = Color3.fromRGB(255, 235, 140), Material = Enum.Material.Neon, Transparency = 0.05, Parent = worldFx })
+	tw(core, 0.4, { Size = Vector3.new(9, 9, 9), Transparency = 1 })
+	local fire = newPart({ Shape = Enum.PartType.Ball, Anchored = true, Size = Vector3.new(1, 1, 1), Position = pos, Color = orange, Material = Enum.Material.Neon, Transparency = 0.3, Parent = worldFx })
+	tw(fire, 0.6, { Size = Vector3.new(16, 16, 16), Transparency = 1 })
+	local ring = newPart({ Shape = Enum.PartType.Cylinder, Anchored = true, Size = Vector3.new(0.4, 1, 1), CFrame = CFrame.new(pos) * RZ(90), Color = Color3.fromRGB(255, 200, 80), Material = Enum.Material.Neon, Transparency = 0.35, Parent = worldFx })
+	tw(ring, 0.55, { Size = Vector3.new(0.4, 26, 26), Transparency = 1 })
+	Debris:AddItem(core, 1)
+	Debris:AddItem(fire, 1)
+	Debris:AddItem(ring, 1)
+
+	local anchor = newPart({ Anchored = true, Transparency = 1, Size = Vector3.new(0.5, 0.5, 0.5), Position = pos, Parent = worldFx })
+	local light = create("PointLight", { Brightness = 10, Range = 28, Color = Color3.fromRGB(255, 170, 60) }, anchor)
+	tw(light, 0.6, { Brightness = 0 })
+	local em = create("ParticleEmitter", {
+		Rate = 0, Lifetime = NumberRange.new(0.5, 1.1), Speed = NumberRange.new(25, 55),
+		SpreadAngle = Vector2.new(180, 180), Acceleration = Vector3.new(0, -35, 0),
+		Color = ColorSequence.new(orange), LightEmission = 1,
+		Size = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.6), NumberSequenceKeypoint.new(1, 0) }),
+	}, anchor)
+	em:Emit(45)
+	local smoke = create("ParticleEmitter", {
+		Rate = 0, Lifetime = NumberRange.new(1.4, 2.4), Speed = NumberRange.new(6, 16),
+		SpreadAngle = Vector2.new(180, 180), Color = ColorSequence.new(Color3.fromRGB(45, 45, 48)),
+		Size = NumberSequence.new({ NumberSequenceKeypoint.new(0, 2), NumberSequenceKeypoint.new(1, 9) }),
+		Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.35), NumberSequenceKeypoint.new(1, 1) }),
+	}, anchor)
+	smoke:Emit(16)
+	Debris:AddItem(anchor, 3)
+
+	playSound(CONFIG.Sounds.Boom, fromRemote and 0.8 or 1.6, 0.7)
+	local dist = Rig.hrp and (Rig.hrp.Position - pos).Magnitude or 999
+	local mag = clamp(1.4 * (1 - dist / 70), 0, 1.4)
+	if mag > 0.05 then shake(fromRemote and mag * 0.6 or mag, 0.45) end
+end
+
+------------------------------------------------------------------------
+-- MODELOS VISUAIS (criados 100% por código)
+------------------------------------------------------------------------
+local function buildAssembly(name, defs)
+	local model = Instance.new("Model")
+	model.Name = name
+	local handle
+	for i, d in ipairs(defs) do
+		local p = newPart({ Name = d.n or ("BTS_Part" .. i), Size = d.s, Color = d.c or C.DARK, Material = d.m or Enum.Material.SmoothPlastic }, d.class)
+		if d.neon then p.Material = Enum.Material.Neon end
+		if i == 1 then
+			handle = p
+		else
+			local w = Instance.new("Weld")
+			w.Part0 = handle
+			w.Part1 = p
+			w.C0 = d.o
+			w.Parent = p
+		end
+		p.Parent = model
+	end
+	model.PrimaryPart = handle
+	return model, handle
+end
+
+local Models = {}
+
+function Models.hook()
+	local model, handle = buildAssembly("BTS_Launcher", {
+		{ n = "BTS_Handle", s = Vector3.new(0.38, 0.42, 0.9), c = Color3.fromRGB(45, 47, 52), m = Enum.Material.Metal },
+		{ n = "Barrel", s = Vector3.new(0.2, 0.2, 0.55), o = CFrame.new(0, 0.04, -0.68), c = C.BLK, m = Enum.Material.Metal },
+		{ s = Vector3.new(0.27, 0.27, 0.1), o = CFrame.new(0, 0.04, -0.45), c = C.YEL, neon = true },
+		{ s = Vector3.new(0.26, 0.5, 0.28), o = CFrame.new(0, -0.42, 0.18) * RX(12), c = C.BLK },
+		{ s = Vector3.new(0.4, 0.1, 0.5), o = CFrame.new(0, 0.26, 0.05), c = C.YEL },
+	})
+	local barrel = model:FindFirstChild("Barrel")
+	local muzzle = create("Attachment", { Name = "Muzzle", CFrame = CFrame.new(0, 0, -0.3) }, barrel)
+	return model, handle, muzzle
+end
+
+function Models.batarang()
+	local dk = Color3.fromRGB(22, 22, 26)
+	local model, handle = buildAssembly("BTS_Batarang", {
+		{ n = "BTS_Body", s = Vector3.new(0.5, 0.1, 0.42), c = C.BLK, m = Enum.Material.Metal },
+		{ s = Vector3.new(0.78, 0.09, 0.3), o = CFrame.new(-0.6, 0, 0.04) * RY(-14), c = dk, m = Enum.Material.Metal },
+		{ s = Vector3.new(0.78, 0.09, 0.3), o = CFrame.new(0.6, 0, 0.04) * RY(14), c = dk, m = Enum.Material.Metal },
+		{ s = Vector3.new(0.42, 0.09, 0.2), o = CFrame.new(-1.05, 0, -0.1) * RY(-38), c = dk, m = Enum.Material.Metal },
+		{ s = Vector3.new(0.42, 0.09, 0.2), o = CFrame.new(1.05, 0, -0.1) * RY(38), c = dk, m = Enum.Material.Metal },
+		{ s = Vector3.new(0.1, 0.09, 0.22), o = CFrame.new(-0.14, 0, -0.28) * RY(-10), c = dk },
+		{ s = Vector3.new(0.1, 0.09, 0.22), o = CFrame.new(0.14, 0, -0.28) * RY(10), c = dk },
+		{ s = Vector3.new(0.14, 0.11, 0.14), c = C.YEL, neon = true, o = CFrame.new(0, 0, 0.02) },
+	})
+	return model, handle
+end
+
+function Models.gel()
+	local model, handle = buildAssembly("BTS_Applicator", {
+		{ n = "BTS_Handle", s = Vector3.new(0.34, 0.34, 0.8), c = Color3.fromRGB(52, 54, 60), m = Enum.Material.Metal },
+		{ s = Vector3.new(0.42, 0.42, 0.55), o = CFrame.new(0, 0.34, 0.05), c = Color3.fromRGB(34, 34, 38), m = Enum.Material.Metal },
+		{ s = Vector3.new(0.44, 0.44, 0.1), o = CFrame.new(0, 0.34, -0.12), c = Color3.fromRGB(255, 140, 20), neon = true },
+		{ n = "Nozzle", s = Vector3.new(0.14, 0.14, 0.4), o = CFrame.new(0, 0, -0.55), c = C.YEL, m = Enum.Material.Metal },
+		{ s = Vector3.new(0.24, 0.45, 0.26), o = CFrame.new(0, -0.38, 0.2) * RX(10), c = C.BLK },
+	})
+	local nozzle = model:FindFirstChild("Nozzle")
+	local muzzle = create("Attachment", { Name = "Muzzle", CFrame = CFrame.new(0, 0, -0.22) }, nozzle)
+	create("ParticleEmitter", {
+		Name = "Spray", Enabled = false, Rate = 70, Lifetime = NumberRange.new(0.2, 0.35),
+		Speed = NumberRange.new(14, 20), SpreadAngle = Vector2.new(7, 7),
+		EmissionDirection = Enum.NormalId.Front, LightEmission = 0.6,
+		Color = ColorSequence.new(Color3.fromRGB(255, 160, 30)),
+		Size = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.22), NumberSequenceKeypoint.new(1, 0.05) }),
+	}, muzzle)
+	return model, handle, muzzle
+end
+
+function Models.detonator()
+	return buildAssembly("BTS_Detonator", {
+		{ n = "BTS_Handle", s = Vector3.new(0.42, 0.16, 0.72), c = C.BLK, m = Enum.Material.Metal },
+		{ s = Vector3.new(0.14, 0.08, 0.14), o = CFrame.new(0, 0.12, -0.14), c = Color3.fromRGB(255, 40, 40), neon = true },
+		{ s = Vector3.new(0.44, 0.05, 0.14), o = CFrame.new(0, 0.1, 0.18), c = C.YEL },
+	})
+end
+
+local Tools = { model = nil, muzzle = nil, det = nil }
+
+function Tools.hide()
+	if Tools.model then pcall(function() Tools.model:Destroy() end) end
+	Tools.model, Tools.muzzle = nil, nil
+end
+
+function Tools.hideDetonator()
+	if Tools.det then pcall(function() Tools.det:Destroy() end) end
+	Tools.det = nil
+end
+
+local function weldToHand(handle, hand)
+	local gy = Rig.r15 and -0.15 or -0.95
+	local w = Instance.new("Weld")
+	w.Part0 = hand
+	w.Part1 = handle
+	w.C0 = CFrame.new(0, gy, 0) * RX(-90)
+	w.Parent = handle
+end
+
+function Tools.show(name)
+	Tools.hide()
+	if not (Rig.alive and Rig.rHand) then return end
+	local model, handle, muzzle = Models[name]()
+	Tools.model, Tools.muzzle = model, muzzle
+	model.Parent = Rig.char
+	weldToHand(handle, Rig.rHand)
+end
+
+function Tools.showDetonator()
+	Tools.hideDetonator()
+	if not (Rig.alive and Rig.lHand) then return end
+	local model, handle = Models.detonator()
+	Tools.det = model
+	model.Parent = Rig.char
+	weldToHand(handle, Rig.lHand)
+end
+
+local function muzzlePos()
+	if Tools.muzzle and Tools.muzzle.Parent then return Tools.muzzle.WorldPosition end
+	return Rig.hrp and Rig.hrp.Position or Vector3.zero
+end
+
+local function handFront()
+	if Rig.rHand and Rig.rHand.Parent then
+		return (Rig.rHand.CFrame * CFrame.new(0, -0.9, 0)).Position
+	end
+	return muzzlePos()
+end
+
+------------------------------------------------------------------------
+-- CABO DO GANCHO
+------------------------------------------------------------------------
+local Cable = { part = nil, hook = nil, conn = nil, startFn = nil, endPos = Vector3.zero }
+
+function Cable.hide()
+	if Cable.conn then Cable.conn:Disconnect() Cable.conn = nil end
+	if Cable.part then pcall(function() Cable.part:Destroy() end) end
+	if Cable.hook then pcall(function() Cable.hook:Destroy() end) end
+	Cable.part, Cable.hook = nil, nil
+end
+
+function Cable.update()
+	if not Cable.part then return end
+	local s = Cable.startFn()
+	local e = Cable.endPos
+	local d = e - s
+	local len = d.Magnitude
+	if len < 0.15 then
+		Cable.part.Transparency = 1
+		Cable.hook.Transparency = 1
+		return
+	end
+	Cable.part.Transparency = 0
+	Cable.hook.Transparency = 0
+	Cable.part.Size = Vector3.new(0.09, 0.09, len)
+	Cable.part.CFrame = CFrame.lookAt(s, e) * CFrame.new(0, 0, -len / 2)
+	Cable.hook.CFrame = CFrame.lookAt(e, e + d.Unit)
+end
+
+function Cable.show(startFn)
+	Cable.hide()
+	Cable.startFn = startFn
+	Cable.endPos = startFn()
+	Cable.part = newPart({ Name = "BTS_Cable", Anchored = true, Size = Vector3.new(0.09, 0.09, 1), Color = Color3.fromRGB(40, 40, 44), Material = Enum.Material.Metal, Parent = worldFx })
+	Cable.hook = newPart({ Name = "BTS_Grapnel", Anchored = true, Size = Vector3.new(0.34, 0.34, 0.7), Color = C.YEL, Material = Enum.Material.Metal, Parent = worldFx })
+	Cable.conn = RunService.RenderStepped:Connect(Cable.update)
+	Anim.addCleanup(Cable.hide)
+end
+
+------------------------------------------------------------------------
+-- CAPA (presa às costas, simulada por molas)
+------------------------------------------------------------------------
+local Cape = { parts = nil, theta = {}, omega = {}, open = nil, folder = nil, clasp = nil }
+local CAPE_ROWS = 7
+local CAPE_SEG = 0.58
+local IDLE_W = { 1.9, 2.0, 2.15, 2.3, 2.45, 2.6, 2.75 }
+local WING_W = { 8.6, 9.2, 8.6, 7.5, 6.1, 4.4, 2.6 }
+
+function Cape.destroy(immediate)
+	pcall(function() RunService:UnbindFromRenderStep("BTS_Cape") end)
+	local folder = Cape.folder
+	Cape.parts, Cape.folder, Cape.clasp = nil, nil, nil
+	if folder then
+		if immediate then
+			pcall(function() folder:Destroy() end)
+		else
+			for _, d in ipairs(folder:GetChildren()) do
+				if d:IsA("BasePart") then tw(d, 0.25, { Transparency = 1 }) end
+			end
+			Debris:AddItem(folder, 0.4)
+		end
+	end
+	Cape.open = nil
+end
+
+function Cape.step(dt)
+	local parts = Cape.parts
+	local torso, hrp = Rig.torso, Rig.hrp
+	if not parts or not Cape.open or not torso or not torso.Parent or not hrp then return end
+	dt = math.min(dt, 1 / 30)
+	local openV = Cape.open.Value
+	local tcf = torso.CFrame
+	local vel = hrp.AssemblyLinearVelocity
+	local spd = vel.Magnitude
+	local g = tcf:VectorToObjectSpace(Vector3.new(0, -1, 0))
+	local wind = Vector3.zero
+	if spd > 0.5 then wind = tcf:VectorToObjectSpace(-vel / spd) end
+	local k = clamp(spd / 40, 0, 1) * 1.6
+	local d = g + wind * k
+	local s = clamp(math.atan2(d.Z, -d.Y), -0.3, 1.75)
+	local now = os.clock()
+	local flutter = 0.025 + clamp(spd / 80, 0, 1) * 0.07 + openV * 0.04
+	local size = torso.Size
+	local P = Vector3.new(0, size.Y / 2 - 0.12, size.Z / 2 + 0.07)
+	local segLen = CAPE_SEG * (1 + openV * 0.35)
+	for i = 1, CAPE_ROWS do
+		local frac = (i - 1) / (CAPE_ROWS - 1)
+		local target = s * (0.18 + 0.82 * frac) + 0.06 * frac + math.sin(now * (8 + i * 1.4) + i * 0.9) * flutter * (0.4 + frac)
+		local K = 70 - i * 6
+		local w = Cape.omega[i] + ((target - Cape.theta[i]) * K - Cape.omega[i] * 9) * dt
+		Cape.omega[i] = w
+		Cape.theta[i] = Cape.theta[i] + w * dt
+		local th = Cape.theta[i]
+		local dir = Vector3.new(0, -math.cos(th), math.sin(th))
+		local center = P + dir * (segLen / 2)
+		local width = lerp(IDLE_W[i], WING_W[i], openV)
+		local yaw = math.sin(now * 5 + i) * 0.04 * (0.3 + flutter * 5)
+		parts[i].Size = Vector3.new(width, segLen + 0.03, 0.1)
+		parts[i].CFrame = tcf * CFrame.new(center) * CFrame.Angles(-th, yaw, 0)
+		P = P + dir * segLen
+	end
+	if Cape.clasp then
+		Cape.clasp.CFrame = tcf * CFrame.new(0, size.Y / 2 - 0.08, -(size.Z / 2 + 0.06))
+	end
+end
+
+function Cape.build()
+	Cape.destroy(true)
+	local torso = Rig.torso
+	if not (Rig.alive and torso) then return end
+	local folder = create("Folder", { Name = "BTS_Cape" }, Rig.char)
+	Cape.folder = folder
+	Cape.open = create("NumberValue", { Name = "Open", Value = 0 }, folder)
+	Cape.parts = {}
+	for i = 1, CAPE_ROWS do
+		local p = newPart({
+			Name = "Row" .. i, Anchored = true, Material = Enum.Material.Fabric,
+			Color = (i % 2 == 0) and Color3.fromRGB(21, 21, 26) or Color3.fromRGB(11, 11, 14),
+			Size = Vector3.new(IDLE_W[i], CAPE_SEG, 0.1), Transparency = 1,
+		})
+		p.Parent = folder
+		Cape.parts[i] = p
+		Cape.theta[i] = 0.1
+		Cape.omega[i] = 0
+		tw(p, 0.35, { Transparency = 0 })
+	end
+	Cape.clasp = newPart({ Name = "Clasp", Anchored = true, Size = Vector3.new(0.45, 0.2, 0.12), Color = C.YEL, Material = Enum.Material.Metal, Transparency = 1 })
+	Cape.clasp.Parent = folder
+	tw(Cape.clasp, 0.35, { Transparency = 0 })
+	RunService:BindToRenderStep("BTS_Cape", Enum.RenderPriority.Character.Value + 1, Cape.step)
+end
+
+------------------------------------------------------------------------
+-- GEL EXPLOSIVO (estado das cargas)
+------------------------------------------------------------------------
+local Gel = { list = {}, conn = nil, fast = false }
+
+function Gel.startBlink()
+	if Gel.conn then return end
+	Gel.conn = RunService.Heartbeat:Connect(function()
+		local rate = Gel.fast and 22 or 6
+		local on = math.sin(os.clock() * rate) > 0
+		for _, g in ipairs(Gel.list) do
+			if g.led and g.led.Parent then
+				g.led.Transparency = on and 0 or 0.8
+				if g.light then g.light.Enabled = on end
+			end
+		end
+	end)
+end
+
+function Gel.clear()
+	for _, g in ipairs(Gel.list) do
+		pcall(function() g.folder:Destroy() end)
+	end
+	Gel.list = {}
+	Gel.fast = false
+	if Gel.conn then Gel.conn:Disconnect() Gel.conn = nil end
+end
+
+local function makeGelBlob(parent, center, normal, size)
+	local p = newPart({
+		Shape = Enum.PartType.Cylinder, Size = Vector3.new(0.12, size, size),
+		Color = Color3.fromRGB(255, 165, 25), Transparency = 0.1, Reflectance = 0.12, Anchored = true,
+	})
+	p.CFrame = CFrame.lookAt(center, center + normal) * CFrame.Angles(0, math.rad(90), 0)
+	p.Parent = parent
+	return p
+end
+
+------------------------------------------------------------------------
+-- PLANAR
+------------------------------------------------------------------------
+local Glide = { conn = nil, lv = nil, att = nil, old = nil, params = nil }
+
+function Glide.stop(silent)
+	if not State.glide then return end
+	State.glide = false
+	if Glide.conn then Glide.conn:Disconnect() Glide.conn = nil end
+	pcall(function()
+		if Glide.lv then Glide.lv:Destroy() end
+		if Glide.att then Glide.att:Destroy() end
+	end)
+	Glide.lv, Glide.att = nil, nil
+	local hum = Rig.hum
+	if hum and hum.Parent and Glide.old then
+		hum.AutoRotate = Glide.old.auto
+		hum.PlatformStand = Glide.old.ps
+		if hum.Health > 0 then hum:ChangeState(Enum.HumanoidStateType.Freefall) end
+	end
+	Glide.old = nil
+	if Rig.alive and not silent then
+		Anim.begin()
+		Anim.pose({}, 0.3)
+		if Cape.open then tw(Cape.open, 0.45, { Value = 0 }) end
+	elseif Cape.open then
+		Cape.open.Value = 0
+	end
+	refreshUI()
+end
+
+function Glide.step(dt, st)
+	local hrp, hum = Rig.hrp, Rig.hum
+	if not Rig.alive or not hrp or not hum or hum.Health <= 0 or not Glide.lv then
+		Glide.stop(true)
+		return
+	end
+	local cam = Workspace.CurrentCamera
+	local cl = cam.CFrame.LookVector
+	local h = st.heading
+	local before = h
+
+	-- direção: segue a câmera (arrastar a tela) + direcional do joystick
+	local camFlat = Vector3.new(cl.X, 0, cl.Z)
+	if camFlat.Magnitude > 0.05 then
+		camFlat = camFlat.Unit
+		local ang = math.atan2(h:Cross(camFlat).Y, h:Dot(camFlat))
+		local maxStep = 1.5 * dt
+		h = CFrame.Angles(0, clamp(ang, -maxStep, maxStep), 0):VectorToWorldSpace(h)
+	end
+	local move = hum.MoveDirection
+	local fwd = 0
+	if move.Magnitude > 0.1 then
+		local right = h:Cross(Vector3.yAxis)
+		local steer = move:Dot(right)
+		fwd = move:Dot(h)
+		h = CFrame.Angles(0, -steer * 1.4 * dt, 0):VectorToWorldSpace(h)
+	end
+	h = Vector3.new(h.X, 0, h.Z).Unit
+	st.heading = h
+
+	-- inclinação lateral conforme a curva
+	local turned = math.atan2(before:Cross(h).Y, before:Dot(h)) / math.max(dt, 1 / 240)
+	local bankT = clamp(math.deg(turned) * 0.35, -32, 32)
+	st.bank = lerp(st.bank, bankT, 1 - math.exp(-6 * dt))
+	local leanT = clamp(52 - cl.Y * 28, 34, 74)
+	st.lean = lerp(st.lean, leanT, 1 - math.exp(-3 * dt))
+
+	-- velocidade: olhar para baixo mergulha, para cima segura a queda
+	local tgtSpeed = clamp(52 + (-cl.Y) * 34 + fwd * 12, 34, 92)
+	local tgtVy = -clamp(13 - cl.Y * 45, 5, 52)
+	st.speed = lerp(st.speed, tgtSpeed, 1 - math.exp(-2 * dt))
+	st.vy = lerp(st.vy, tgtVy, 1 - math.exp(-2.5 * dt))
+	Glide.lv.VectorVelocity = h * st.speed + Vector3.new(0, st.vy, 0)
+
+	local pos = hrp.Position
+	hrp.CFrame = CFrame.lookAt(pos, pos + h)
+
+	if os.clock() >= st.entry then
+		local m = Rig.joints.RJ
+		if m and m.Parent and Rig.orig[m] then
+			m.C0 = offsetC0(Rig.orig[m], RZ(st.bank) * RX(-st.lean))
+		end
+	end
+
+	local elapsed = os.clock() - st.t0
+	if elapsed > 0.45 then
+		-- pouso
+		local res = Workspace:Raycast(pos, Vector3.new(0, -5, 0), Glide.params)
+		if res then Glide.stop() return end
+		-- parede
+		local moved = Vector3.new(pos.X - st.last.X, 0, pos.Z - st.last.Z).Magnitude / math.max(dt, 1 / 120)
+		if moved < st.speed * 0.2 then st.stall = st.stall + dt else st.stall = 0 end
+		if st.stall > 0.5 then Glide.stop() return end
+	end
+	st.last = pos
+end
+
+function Glide.start()
+	if State.glide or not State.cape or not Rig.alive then return end
+	local hrp, hum = Rig.hrp, Rig.hum
+	if hum.Health <= 0 then return end
+	Anim.begin()
+	Tools.hide()
+	Tools.hideDetonator()
+	State.tool = nil
+	State.glide = true
+	State.glideStart = os.clock()
+
+	local look = hrp.CFrame.LookVector
+	local heading = Vector3.new(look.X, 0, look.Z)
+	heading = heading.Magnitude > 0.01 and heading.Unit or Vector3.new(0, 0, -1)
+	local vel0 = hrp.AssemblyLinearVelocity
+	if hum.FloorMaterial ~= Enum.Material.Air then
+		vel0 = Vector3.new(vel0.X, 44, vel0.Z)
+		hrp.AssemblyLinearVelocity = vel0
+		hum:ChangeState(Enum.HumanoidStateType.Jumping)
+	end
+
+	local att = create("Attachment", { Name = "BTS_GlideAtt" }, hrp)
+	local lv = create("LinearVelocity", {
+		Name = "BTS_Glide", Attachment0 = att, RelativeTo = Enum.ActuatorRelativeTo.World,
+		MaxForce = 1e7, VectorVelocity = vel0,
+	}, hrp)
+	Glide.att, Glide.lv = att, lv
+	Glide.old = { auto = hum.AutoRotate, ps = hum.PlatformStand }
+	Glide.params = rayParams()
+	hum.AutoRotate = false
+	hum.PlatformStand = true
+
+	-- abre a capa e estende os braços
+	Anim.pose({
+		RS = RZ(86) * RX(-10), LS = RZ(-86) * RX(-10),
+		RE = RX(6), LE = RX(6), NK = RX(34), RJ = RX(-52),
+	}, 0.32, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+	if Cape.open then tw(Cape.open, 0.4, { Value = 1 }, Enum.EasingStyle.Back, Enum.EasingDirection.Out) end
+
+	local st = {
+		heading = heading,
+		speed = math.max(40, Vector3.new(vel0.X, 0, vel0.Z).Magnitude),
+		vy = vel0.Y, bank = 0, lean = 52, t0 = os.clock(), entry = os.clock() + 0.34,
+		stall = 0, last = hrp.Position,
+	}
+	Glide.conn = RunService.Heartbeat:Connect(function(dt) Glide.step(dt, st) end)
+	refreshUI()
+end
+
+------------------------------------------------------------------------
+-- AÇÕES: mira, giro do corpo, puxão do gancho
+------------------------------------------------------------------------
+local function aimInfo(range)
+	local cam = Workspace.CurrentCamera
+	local vs = cam.ViewportSize
+	local ray = cam:ViewportPointToRay(vs.X / 2, vs.Y / 2)
+	local dir = ray.Direction
+	local res = Workspace:Raycast(ray.Origin, dir * (range + 25), rayParams())
+	local endPoint = res and res.Position or (ray.Origin + dir * range)
+	return res, dir, endPoint
+end
+
+local function turnToward(token, dir, dur)
+	local hrp = Rig.hrp
+	local flat = Vector3.new(dir.X, 0, dir.Z)
+	if not hrp or flat.Magnitude < 0.01 then return true end
+	local startRot = hrp.CFrame.Rotation
+	local targetRot = CFrame.lookAt(Vector3.zero, flat).Rotation
+	local t0 = os.clock()
+	while token == Anim.token do
+		local a = math.min((os.clock() - t0) / dur, 1)
+		hrp.CFrame = CFrame.new(hrp.Position) * startRot:Lerp(targetRot, a)
+		if a >= 1 then break end
+		RunService.Heartbeat:Wait()
+	end
+	return token == Anim.token
+end
+
+local function pullPlayer(token, target)
+	local hrp, hum = Rig.hrp, Rig.hum
+	local att = create("Attachment", { Name = "BTS_PullAtt" }, hrp)
+	local lv = create("LinearVelocity", {
+		Name = "BTS_Pull", Attachment0 = att, RelativeTo = Enum.ActuatorRelativeTo.World,
+		MaxForce = 1e7, VectorVelocity = Vector3.zero,
+	}, hrp)
+	local oldAuto = hum.AutoRotate
+	hum.AutoRotate = false
+	local done = false
+	local function cleanup()
+		if done then return end
+		done = true
+		pcall(function() lv:Destroy() end)
+		pcall(function() att:Destroy() end)
+		pcall(function() hum.AutoRotate = oldAuto end)
+	end
+	Anim.addCleanup(cleanup)
+	hum:ChangeState(Enum.HumanoidStateType.Freefall)
+
+	local t0 = os.clock()
+	local lastPos, lastCheck = hrp.Position, t0
+	local arrived = false
+	local lastDir = Vector3.new(0, 0, -1)
+	while token == Anim.token and hum.Health > 0 do
+		RunService.Heartbeat:Wait()
+		local pos = hrp.Position
+		local to = target - pos
+		local dist = to.Magnitude
+		if dist < 7 then arrived = true break end
+		local el = os.clock() - t0
+		if el > 3.5 then break end
+		lastDir = to.Unit
+		lv.VectorVelocity = lastDir * math.min(CONFIG.HookPullSpeed, 28 + el * 220)
+		local flat = Vector3.new(to.X, 0, to.Z)
+		if flat.Magnitude > 0.5 then hrp.CFrame = CFrame.lookAt(pos, pos + flat) end
+		if os.clock() - lastCheck > 0.5 then
+			if (pos - lastPos).Magnitude < 3 then break end
+			lastPos, lastCheck = pos, os.clock()
+		end
+	end
+	cleanup()
+	if arrived and token == Anim.token and hum.Health > 0 then
+		-- impulso final (sobe a borda como no jogo)
+		hrp.AssemblyLinearVelocity = lastDir * 38 + Vector3.new(0, 36, 0)
+	end
+	return arrived
+end
+
+------------------------------------------------------------------------
+-- GANCHO
+------------------------------------------------------------------------
+local function fireHook()
+	if State.tool ~= "hook" or State.busy or State.glide or not Rig.alive then return end
+	if os.clock() < State.cd.hook then toast("Gancho recarregando…") return end
+	local res = aimInfo(CONFIG.HookRange)
+	if not res or (res.Position - Rig.hrp.Position).Magnitude > CONFIG.HookRange then
+		toast("Sem ponto de ancoragem ao alcance")
+		return
+	end
+	State.cd.hook = os.clock() + CONFIG.HookCooldown
+	flashAction(CONFIG.HookCooldown)
+	local target = res.Position
+	runJob(function(token)
+		local hrp = Rig.hrp
+		if not turnToward(token, target - hrp.Position, 0.12) then return end
+		local dirT = (target - muzzlePos()).Unit
+		local pitch = math.deg(math.asin(clamp(dirT.Y, -1, 1)))
+		local aimA = clamp(90 + pitch, 15, 175)
+		local aimPose = { RS = RX(aimA), RE = RX(6), LS = RX(aimA - 12) * RZ(28), LE = RX(38), WA = RY(-8) }
+		if not Anim.step(token, aimPose, 0.14) then return end
+
+		Cable.show(muzzlePos)
+		playSound(CONFIG.Sounds.Fire, 0.7, 1.2)
+		if not Anim.step(token, { RS = RX(aimA + 9), RE = RX(4), LS = RX(aimA - 12) * RZ(28), LE = RX(38), WA = RY(-4) }, 0.05, Enum.EasingStyle.Quad, Enum.EasingDirection.Out) then return end
+		Anim.pose(aimPose, 0.12)
+
+		local startPt = muzzlePos()
+		local dur = math.max((target - startPt).Magnitude / 230, 0.08)
+		local t0 = os.clock()
+		while token == Anim.token do
+			local a = math.min((os.clock() - t0) / dur, 1)
+			Cable.endPos = startPt:Lerp(target, a)
+			if a >= 1 then break end
+			RunService.Heartbeat:Wait()
+		end
+		if token ~= Anim.token then return end
+		sparks(target, Color3.fromRGB(255, 210, 60), 14)
+		playSound(CONFIG.Sounds.Hit, 0.6, 1.3)
+
+		Anim.pose({ RS = RX(clamp(aimA + 18, 0, 178)), RE = RX(10), LS = RX(-18) * RZ(-30), LE = RX(12), WA = RX(-14), NK = RX(8) }, 0.15)
+		pullPlayer(token, target)
+		if token ~= Anim.token then return end
+
+		-- recolhe o cabo
+		local r0 = os.clock()
+		while token == Anim.token do
+			local a = math.min((os.clock() - r0) / 0.15, 1)
+			Cable.endPos = muzzlePos():Lerp(target, 1 - a)
+			if a >= 1 then break end
+			RunService.Heartbeat:Wait()
+		end
+		Cable.hide()
+		Anim.step(token, HOLD.hook, 0.25)
+	end)
+end
+
+------------------------------------------------------------------------
+-- BATARANGUES
+------------------------------------------------------------------------
+local function launchBatarang(pos, dir)
+	local model, body = Models.batarang()
+	body.Anchored = true
+	model.Parent = worldFx
+	model:PivotTo(CFrame.new(pos))
+	local a0 = create("Attachment", { Position = Vector3.new(-1.2, 0, 0) }, body)
+	local a1 = create("Attachment", { Position = Vector3.new(1.2, 0, 0) }, body)
+	create("Trail", {
+		Attachment0 = a0, Attachment1 = a1, Lifetime = 0.22, LightEmission = 0.5, MinLength = 0.05,
+		Color = ColorSequence.new(C.YEL),
+		Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.35), NumberSequenceKeypoint.new(1, 1) }),
+	}, body)
+	local params = rayParams()
+	local traveled, spin = 0, 0
+	local conn
+	conn = RunService.Heartbeat:Connect(function(dt)
+		local step = CONFIG.BatarangSpeed * dt
+		local res = Workspace:Raycast(pos, dir * (step + 0.4), params)
+		spin = spin + dt * 28
+		if res then
+			conn:Disconnect()
+			local p = res.Position + res.Normal * 0.05
+			model:PivotTo(CFrame.lookAt(p, p + res.Normal) * RX(-90) * RY(math.random(0, 359)))
+			sparks(res.Position, Color3.fromRGB(255, 220, 90), 10)
+			playSound(CONFIG.Sounds.Hit, 0.6, 1.1)
+			Debris:AddItem(model, 6)
+			return
+		end
+		pos = pos + dir * step
+		traveled = traveled + step
+		model:PivotTo(CFrame.new(pos) * CFrame.Angles(0, spin, 0))
+		if traveled > CONFIG.BatarangRange then
+			conn:Disconnect()
+			model:Destroy()
+		end
+	end)
+	Debris:AddItem(model, 8)
+end
+
+local function throwBatarang()
+	if State.tool ~= "batarang" or State.busy or State.glide or not Rig.alive then return end
+	if os.clock() < State.cd.batarang then return end
+	State.cd.batarang = os.clock() + CONFIG.BatarangCooldown
+	flashAction(CONFIG.BatarangCooldown)
+	local res, camDir, endPoint = aimInfo(CONFIG.BatarangRange)
+	runJob(function(token)
+		if not turnToward(token, camDir, 0.1) then return end
+		local pitch = math.deg(math.asin(clamp(camDir.Y, -1, 1)))
+		local a = clamp(90 + pitch, 20, 170)
+		-- preparação
+		if not Anim.step(token, { RS = RX(-55) * RZ(-8), RE = RX(85), LS = RX(20) * RZ(12), LE = RX(30), WA = RY(-34), NK = RY(-10) }, 0.16) then return end
+		-- arremesso (braço estende)
+		Anim.pose({ RS = RX(a) * RZ(-4), RE = RX(8), LS = RX(-15) * RZ(-32), LE = RX(18), WA = RY(26), NK = RY(10) }, 0.12, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+		task.wait(0.07)
+		if token ~= Anim.token then return end
+		local startPos = handFront()
+		local aimTarget = res and res.Position or endPoint
+		local d = aimTarget - startPos
+		local dir = d.Magnitude > 1 and d.Unit or camDir
+		Tools.hide()
+		launchBatarang(startPos, dir)
+		playSound(CONFIG.Sounds.Throw, 0.7, 1.4)
+		task.wait(0.06)
+		-- acompanhamento e retorno
+		if not Anim.step(token, { RS = RX(a + 14), RE = RX(2), LS = RX(-20) * RZ(-34), LE = RX(14), WA = RY(32), NK = RY(12) }, 0.1) then return end
+		if not Anim.step(token, BELT.batarang, 0.16) then return end
+		Tools.show("batarang")
+		playSound(CONFIG.Sounds.Draw, 0.4, 1.3)
+		Anim.step(token, HOLD.batarang, 0.2)
+	end)
+end
+
+------------------------------------------------------------------------
+-- GEL EXPLOSIVO
+------------------------------------------------------------------------
+local function findGelSurface()
+	local params = rayParams()
+	local reach = CONFIG.GelReach
+	local hrp = Rig.hrp
+	local cam = Workspace.CurrentCamera
+	local vs = cam.ViewportSize
+	local ray = cam:ViewportPointToRay(vs.X / 2, vs.Y / 2)
+	local res = Workspace:Raycast(ray.Origin, ray.Direction * (reach + 25), params)
+	if res and (res.Position - hrp.Position).Magnitude <= reach then return res end
+	local o = Rig.torso.Position
+	local lk = hrp.CFrame.LookVector
+	local f = Vector3.new(lk.X, 0, lk.Z)
+	if f.Magnitude > 0.01 then
+		res = Workspace:Raycast(o, f.Unit * (reach * 0.8), params)
+		if res then return res end
+	end
+	return Workspace:Raycast(o, Vector3.new(0, -6, 0), params)
+end
+
+local function applyGel()
+	if State.tool ~= "gel" or State.busy or State.glide or not Rig.alive then return end
+	if os.clock() < State.cd.gel then return end
+	if #Gel.list >= CONFIG.GelMax then toast("Limite de cargas — detone primeiro") return end
+	local hit = findGelSurface()
+	if not hit then toast("Aproxime-se de uma superfície") return end
+	State.cd.gel = os.clock() + CONFIG.GelCooldown
+	flashAction(CONFIG.GelCooldown + 1)
+
+	local hitPos, normal = hit.Position, hit.Normal
+	runJob(function(token)
+		local hrp = Rig.hrp
+		if not turnToward(token, hitPos - hrp.Position, 0.14) then return end
+		local to = hitPos - (Rig.torso.Position + Vector3.new(0, 0.6, 0))
+		local pitch = math.deg(math.asin(clamp(to.Unit.Y, -1, 1)))
+		local a = clamp(90 + pitch, 20, 170)
+
+		local entry = { folder = create("Folder", { Name = "BTS_Gel" }, worldFx), pos = hitPos + normal * 0.1, done = false }
+		Anim.addCleanup(function()
+			if not entry.done then pcall(function() entry.folder:Destroy() end) end
+			if Tools.muzzle then
+				local sp = Tools.muzzle:FindFirstChild("Spray")
+				if sp then sp.Enabled = false end
+			end
+		end)
+
+		-- inclina o corpo e estende o aplicador
+		if not Anim.step(token, { RS = RX(a), RE = RX(14), LS = RX(30) * RZ(-18), LE = RX(40), WA = RX(-22) * RY(-6) }, 0.2) then return end
+		playSound(CONFIG.Sounds.Draw, 0.35, 0.8)
+		local spray = Tools.muzzle and Tools.muzzle:FindFirstChild("Spray")
+		if spray then spray.Enabled = true end
+
+		local up = math.abs(normal.Y) > 0.9 and Vector3.xAxis or Vector3.yAxis
+		local t1 = normal:Cross(up).Unit
+		local t2 = normal:Cross(t1).Unit
+		local sweeps = { -16, 16, -10, 12, 0 }
+		for i, yaw in ipairs(sweeps) do
+			local pose = { RS = RY(yaw) * RX(a), RE = RX(14), LS = RX(30) * RZ(-18), LE = RX(40), WA = RX(-22) * RY(-6) }
+			if not Anim.step(token, pose, 0.17) then return end
+			local lateral = (yaw / 16) * 0.9
+			for _ = 1, 3 do
+				local c = hitPos + normal * 0.06 + t1 * (lateral + (math.random() - 0.5) * 0.7) + t2 * ((math.random() - 0.5) * 1.3)
+				makeGelBlob(entry.folder, c, normal, 0.4 + math.random() * 0.65)
+			end
+		end
+		if spray then spray.Enabled = false end
+
+		-- LED de armado
+		local ledPos = hitPos + normal * 0.16
+		entry.led = newPart({ Shape = Enum.PartType.Ball, Anchored = true, Size = Vector3.new(0.22, 0.22, 0.22), Position = ledPos, Color = Color3.fromRGB(255, 40, 40), Material = Enum.Material.Neon, Parent = entry.folder })
+		entry.light = create("PointLight", { Color = Color3.fromRGB(255, 50, 50), Range = 6, Brightness = 2 }, entry.led)
+		entry.done = true
+		table.insert(Gel.list, entry)
+		Gel.startBlink()
+		playSound(CONFIG.Sounds.Beep, 0.5, 1.1)
+		refreshUI()
+		Anim.step(token, HOLD.gel, 0.25)
+	end)
+end
+
+local GelEvents = nil -- RemoteEvent opcional do servidor
+
+local function detonateGel()
+	if State.tool ~= "gel" or State.busy or State.glide or not Rig.alive then return end
+	if #Gel.list == 0 then toast("Nenhuma carga aplicada") return end
+	runJob(function(token)
+		if not Anim.step(token, { RS = RX(50) * RZ(-10), RE = RX(30), LS = RX(34), LE = RX(10), WA = RY(10) }, 0.12) then return end
+		Tools.showDetonator()
+		if not Anim.step(token, { RS = RX(50) * RZ(-10), RE = RX(30), LS = RX(78) * RZ(24), LE = RX(70), WA = RY(14) }, 0.2) then return end
+		if not Anim.step(token, { RS = RX(50) * RZ(-10), RE = RX(30), LS = RX(82) * RZ(24), LE = RX(62), WA = RY(14) }, 0.07) then return end
+		playSound(CONFIG.Sounds.Beep, 0.7, 1.6)
+		Gel.fast = true
+		task.wait(0.3)
+		if token ~= Anim.token then Gel.fast = false return end
+		local list = Gel.list
+		Gel.list = {}
+		for _, g in ipairs(list) do
+			boom(g.pos, false)
+			if GelEvents then pcall(function() GelEvents:FireServer("GelDetonate", g.pos) end) end
+			pcall(function() g.folder:Destroy() end)
+			task.wait(0.12)
+		end
+		Gel.fast = false
+		if Gel.conn and #Gel.list == 0 then Gel.conn:Disconnect() Gel.conn = nil end
+		refreshUI()
+		if not Anim.step(token, HOLD.gel, 0.25) then return end
+		Tools.hideDetonator()
+	end)
+end
+
+------------------------------------------------------------------------
+-- VISÃO NOTURNA (restaura tudo ao desligar)
+------------------------------------------------------------------------
+local NV = { original = nil, cc = nil, bloom = nil, overlay = nil }
+
+function NV.enable()
+	if not NV.original then
+		NV.original = {
+			Ambient = Lighting.Ambient,
+			OutdoorAmbient = Lighting.OutdoorAmbient,
+			Brightness = Lighting.Brightness,
+			ExposureCompensation = Lighting.ExposureCompensation,
+		}
+	end
+	if not NV.cc or not NV.cc.Parent then
+		NV.cc = create("ColorCorrectionEffect", { Name = "BTS_NV_CC", TintColor = Color3.new(1, 1, 1), Saturation = 0, Contrast = 0, Brightness = 0 }, Lighting)
+	end
+	if not NV.bloom or not NV.bloom.Parent then
+		NV.bloom = create("BloomEffect", { Name = "BTS_NV_Bloom", Intensity = 0, Size = 24, Threshold = 0.9 }, Lighting)
+	end
+	local o = NV.original
+	tw(Lighting, 0.5, {
+		Ambient = Color3.fromRGB(80, 130, 85), OutdoorAmbient = Color3.fromRGB(80, 130, 85),
+		Brightness = o.Brightness + 0.5, ExposureCompensation = o.ExposureCompensation + 0.7,
+	})
+	tw(NV.cc, 0.5, { TintColor = Color3.fromRGB(170, 255, 185), Saturation = -0.25, Contrast = 0.12, Brightness = 0.06 })
+	tw(NV.bloom, 0.5, { Intensity = 0.5 })
+	if NV.overlay then NV.overlay.Visible = true end
+	playSound(CONFIG.Sounds.Click, 0.5, 0.8)
+end
+
+function NV.disable()
+	local o = NV.original
+	if not o then return end
+	tw(Lighting, 0.4, { Ambient = o.Ambient, OutdoorAmbient = o.OutdoorAmbient, Brightness = o.Brightness, ExposureCompensation = o.ExposureCompensation })
+	if NV.cc then tw(NV.cc, 0.4, { TintColor = Color3.new(1, 1, 1), Saturation = 0, Contrast = 0, Brightness = 0 }) end
+	if NV.bloom then tw(NV.bloom, 0.4, { Intensity = 0 }) end
+	if NV.overlay then NV.overlay.Visible = false end
+	task.delay(0.5, function()
+		if State.nv then return end -- religou antes do fim
+		local orig = NV.original
+		if orig then
+			Lighting.Ambient = orig.Ambient
+			Lighting.OutdoorAmbient = orig.OutdoorAmbient
+			Lighting.Brightness = orig.Brightness
+			Lighting.ExposureCompensation = orig.ExposureCompensation
+		end
+		if NV.cc then NV.cc:Destroy() NV.cc = nil end
+		if NV.bloom then NV.bloom:Destroy() NV.bloom = nil end
+		NV.original = nil
+	end)
+end
+
+------------------------------------------------------------------------
+-- GPS (usa apenas personagens que o cliente já enxerga)
+------------------------------------------------------------------------
+local GPS = { ui = nil, accum = 0 }
+
+function GPS.update()
+	local ui = GPS.ui
+	if not ui or not State.gps then return end
+	local hrp = Rig.hrp
+	local cam = Workspace.CurrentCamera
+	local cl = cam.CFrame.LookVector
+	local f = Vector3.new(cl.X, 0, cl.Z)
+	f = f.Magnitude > 0.01 and f.Unit or Vector3.new(0, 0, -1)
+	local r = f:Cross(Vector3.yAxis)
+	if hrp then
+		ui.coords.Text = string.format("X %d  Y %d  Z %d", hrp.Position.X, hrp.Position.Y, hrp.Position.Z)
+	end
+	ui.heading.Text = string.format("Rumo %03d°", (math.deg(math.atan2(f.X, -f.Z)) + 360) % 360)
+
+	local list = {}
+	if hrp then
+		for _, pl in ipairs(Players:GetPlayers()) do
+			if pl ~= player then
+				local ch = pl.Character
+				local root = ch and ch:FindFirstChild("HumanoidRootPart")
+				if root then
+					local off = root.Position - hrp.Position
+					table.insert(list, { name = pl.DisplayName, off = off, dist = off.Magnitude })
+				end
+			end
+		end
+	end
+	table.sort(list, function(a, b) return a.dist < b.dist end)
+
+	local radius = ui.radarSize / 2 - 6
+	for i, dot in ipairs(ui.dots) do
+		local e = list[i]
+		if e then
+			local sc = radius / CONFIG.GpsRange
+			local x, y = e.off:Dot(r) * sc, -e.off:Dot(f) * sc
+			local m = math.sqrt(x * x + y * y)
+			local out = m > radius
+			if out then x, y = x / m * radius, y / m * radius end
+			dot.Position = UDim2.new(0.5, x - 4, 0.5, y - 4)
+			dot.BackgroundColor3 = (i == 1) and C.YEL or C.LIT
+			dot.BackgroundTransparency = out and 0.6 or 0
+			dot.Visible = true
+		else
+			dot.Visible = false
+		end
+	end
+	local lines = {}
+	for i = 1, math.min(3, #list) do
+		lines[i] = string.format("%s — %d st", list[i].name, list[i].dist)
+	end
+	ui.list.Text = (#lines > 0) and table.concat(lines, "\n") or "Nenhum jogador visível"
+end
+
+RunService.Heartbeat:Connect(function(dt)
+	if not State.gps then return end
+	GPS.accum = GPS.accum + dt
+	if GPS.accum >= 0.12 then
+		GPS.accum = 0
+		GPS.update()
+	end
+end)
+
+------------------------------------------------------------------------
+-- TROCA DE EQUIPAMENTO / TOGGLES
+------------------------------------------------------------------------
+local function selectTool(name)
+	if not Rig.alive then toast("Aguardando o personagem…") return end
+	if State.glide then Glide.stop() end
+	local prev = State.tool
+	if prev == name then name = nil end
+	local hadModel = Tools.model ~= nil
+	local token = Anim.begin() -- cancela qualquer animação em andamento
+	State.tool = name
+	State.busy = true
+	refreshUI()
+	task.spawn(function()
+		local ok, err = pcall(function()
+			Tools.hideDetonator()
+			if hadModel and prev then
+				if not Anim.step(token, BELT[prev], 0.14) then return end
+			end
+			Tools.hide()
+			if name then
+				if not Anim.step(token, BELT[name], 0.15) then return end
+				Tools.show(name)
+				playSound(CONFIG.Sounds.Draw, 0.5)
+				Anim.step(token, HOLD[name], 0.22)
+			else
+				Anim.step(token, {}, 0.2)
+			end
+		end)
+		if not ok then warn("[BatmanTacticalSystem] " .. tostring(err)) end
+		if token == Anim.token then State.busy = false end
+	end)
+end
+
+local function setCape(on)
+	if on == State.cape then return end
+	State.cape = on
+	if on then
+		if Rig.alive then
+			Cape.build()
+			if not State.tool and not State.busy and not State.glide then
+				runJob(function(token)
+					-- capa se abre e assenta
+					if Cape.open then tw(Cape.open, 0.28, { Value = 0.55 }) end
+					if not Anim.step(token, { RS = RX(110) * RZ(-10), LS = RX(110) * RZ(10), RE = RX(30), LE = RX(30), NK = RX(-8) }, 0.18) then return end
+					if Cape.open then tw(Cape.open, 0.3, { Value = 0.4 }) end
+					if not Anim.step(token, { RS = RZ(70) * RX(-15), LS = RZ(-70) * RX(-15), RE = RX(8), LE = RX(8) }, 0.18) then return end
+					if Cape.open then tw(Cape.open, 0.45, { Value = 0 }) end
+					Anim.step(token, {}, 0.25)
+				end)
+			end
+		end
+	else
+		if State.glide then Glide.stop() end
+		Cape.destroy(false)
+	end
+	refreshUI()
+end
+
+local function setGPS(on)
+	State.gps = on
+	if GPS.ui then
+		GPS.ui.frame.Visible = on
+		if on then GPS.update() end
+	end
+	refreshUI()
+end
+
+local function setNV(on)
+	State.nv = on
+	if on then NV.enable() else NV.disable() end
+	refreshUI()
+end
+
+local function primaryAction()
+	if State.tool == "hook" then fireHook()
+	elseif State.tool == "batarang" then throwBatarang()
+	elseif State.tool == "gel" then applyGel()
+	elseif State.cape then
+		if State.glide then Glide.stop() else Glide.start() end
+	end
+end
+
+local function secondaryAction()
+	if State.tool == "gel" and #Gel.list > 0 then
+		detonateGel()
+	elseif State.cape and State.tool then
+		Glide.start()
+	end
+end
+
+------------------------------------------------------------------------
+-- INTERFACE (mobile-first)
+------------------------------------------------------------------------
+local gui = create("ScreenGui", {
+	Name = "BatmanTacticalSystem", ResetOnSpawn = false, IgnoreGuiInset = true,
+	ZIndexBehavior = Enum.ZIndexBehavior.Sibling, DisplayOrder = 100,
+}, playerGui)
+
+local function corner(inst, r)
+	return create("UICorner", { CornerRadius = r or UDim.new(0, 8) }, inst)
+end
+local function stroke(inst, color, th)
+	return create("UIStroke", { Color = color or C.YEL, Thickness = th or 1.5, ApplyStrokeMode = Enum.ApplyStrokeMode.Border }, inst)
+end
+
+local function uiBaseScale()
+	local vs = (Workspace.CurrentCamera and Workspace.CurrentCamera.ViewportSize) or Vector2.new(800, 400)
+	return clamp(math.min(vs.X / 800, vs.Y / 400), 0.72, 1.15)
+end
+local uiBase = uiBaseScale()
+
+local function makeDraggable(handle, target, onTap)
+	local dragging, active, startIn, startPos, moved = false, nil, Vector3.zero, Vector2.zero, false
+	handle.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging, active, moved = true, input, false
+			startIn = input.Position
+			startPos = target.AbsolutePosition
+			input.Changed:Connect(function()
+				if input.UserInputState == Enum.UserInputState.End then
+					if dragging and active == input and not moved and onTap then onTap() end
+					if active == input then dragging = false end
+				end
+			end)
+		end
+	end)
+	UserInputService.InputChanged:Connect(function(input)
+		if not dragging or not active then return end
+		local isMouse = input.UserInputType == Enum.UserInputType.MouseMovement and active.UserInputType == Enum.UserInputType.MouseButton1
+		if isMouse or input == active then
+			local d = input.Position - startIn
+			if d.Magnitude > 8 then moved = true end
+			if moved then
+				local sz = gui.AbsoluteSize
+				local w, h = target.AbsoluteSize.X, target.AbsoluteSize.Y
+				local x = clamp(startPos.X + d.X, 0, math.max(sz.X - w, 0))
+				local y = clamp(startPos.Y + d.Y, 0, math.max(sz.Y - h, 0))
+				target.Position = UDim2.fromOffset(x, y)
+			end
+		end
+	end)
+end
+
+-- botão flutuante 🦇
+local fab = create("TextButton", {
+	Name = "FAB", Size = UDim2.fromOffset(58, 58), Position = UDim2.new(1, -84, 0.32, 0),
+	BackgroundColor3 = C.BLK, Text = "🦇", TextSize = 30, TextColor3 = C.YEL,
+	AutoButtonColor = false, Font = Enum.Font.GothamBold,
+}, gui)
+corner(fab, UDim.new(1, 0))
+local fabStroke = stroke(fab, C.YEL, 2.5)
+local fabScale = create("UIScale", { Scale = uiBase }, fab)
+
+-- painel
+local PANEL_W, PANEL_H, TITLE_H = 292, 270, 40
+local panel = create("Frame", {
+	Name = "Panel", Size = UDim2.fromOffset(PANEL_W, PANEL_H), Position = UDim2.fromOffset(40, 20),
+	BackgroundColor3 = C.BLK, BorderSizePixel = 0, ClipsDescendants = true, Visible = false, Active = true,
+}, gui)
+corner(panel, UDim.new(0, 12))
+stroke(panel, C.YEL, 1.5)
+local panelScale = create("UIScale", { Scale = uiBase }, panel)
+
+local titleBar = create("Frame", { Name = "TitleBar", Size = UDim2.new(1, 0, 0, TITLE_H), BackgroundColor3 = C.DARK, BorderSizePixel = 0 }, panel)
+create("Frame", { Size = UDim2.new(1, 0, 0, 2), Position = UDim2.new(0, 0, 1, -2), BackgroundColor3 = C.YEL, BorderSizePixel = 0 }, titleBar)
+local titleLbl = create("TextLabel", {
+	Size = UDim2.new(1, -92, 1, 0), Position = UDim2.fromOffset(10, 0), BackgroundTransparency = 1,
+	Text = "🦇 BATMAN TACTICAL SYSTEM", TextColor3 = C.YEL, Font = Enum.Font.GothamBlack,
+	TextScaled = true, TextXAlignment = Enum.TextXAlignment.Left,
+}, titleBar)
+create("UITextSizeConstraint", { MaxTextSize = 14, MinTextSize = 8 }, titleLbl)
+
+local function titleButton(text, xOff)
+	local b = create("TextButton", {
+		Size = UDim2.fromOffset(32, 28), Position = UDim2.new(1, xOff, 0.5, -14), BackgroundColor3 = C.MID,
+		Text = text, TextColor3 = C.LIT, TextSize = 16, Font = Enum.Font.GothamBold, AutoButtonColor = false,
+	}, titleBar)
+	corner(b, UDim.new(0, 6))
+	return b
+end
+local btnClose = titleButton("✕", -38)
+local btnMin = titleButton("—", -74)
+
+local body = create("Frame", { Name = "Body", Size = UDim2.new(1, 0, 1, -TITLE_H), Position = UDim2.fromOffset(0, TITLE_H), BackgroundTransparency = 1 }, panel)
+
+local grid = create("Frame", { Size = UDim2.new(1, -16, 0, 144), Position = UDim2.fromOffset(8, 8), BackgroundTransparency = 1 }, body)
+create("UIGridLayout", {
+	CellSize = UDim2.new(0.5, -3, 0, 44), CellPadding = UDim2.fromOffset(6, 6),
+	SortOrder = Enum.SortOrder.LayoutOrder, FillDirection = Enum.FillDirection.Horizontal,
+}, grid)
+
+local EQUIP = {
+	{ id = "cape", icon = "🧣", name = "CAPA" },
+	{ id = "hook", icon = "⚓", name = "GANCHO" },
+	{ id = "batarang", icon = "🦇", name = "BATARANGUE" },
+	{ id = "gps", icon = "📡", name = "GPS" },
+	{ id = "nv", icon = "👁", name = "VISÃO NOT." },
+	{ id = "gel", icon = "💥", name = "GEL EXPL." },
+}
+local equipButtons = {}
+
+local function isActive(id)
+	if id == "cape" then return State.cape end
+	if id == "gps" then return State.gps end
+	if id == "nv" then return State.nv end
+	return State.tool == id
+end
+
+local function onEquipPressed(id)
+	playSound(CONFIG.Sounds.Click, 0.35)
+	if id == "cape" then setCape(not State.cape)
+	elseif id == "gps" then setGPS(not State.gps)
+	elseif id == "nv" then setNV(not State.nv)
+	else selectTool(id) end
+end
+
+for i, e in ipairs(EQUIP) do
+	local btn = create("TextButton", {
+		Name = e.id, LayoutOrder = i, BackgroundColor3 = C.MID, AutoButtonColor = false,
+		Text = e.icon .. " " .. e.name, TextColor3 = C.LIT, Font = Enum.Font.GothamBold, TextScaled = true,
+		TextXAlignment = Enum.TextXAlignment.Left,
+	}, grid)
+	corner(btn, UDim.new(0, 8))
+	local st = stroke(btn, C.LINE, 1.2)
+	create("UIPadding", { PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 24), PaddingTop = UDim.new(0, 8), PaddingBottom = UDim.new(0, 8) }, btn)
+	create("UITextSizeConstraint", { MaxTextSize = 14, MinTextSize = 8 }, btn)
+	local led = create("Frame", { Size = UDim2.fromOffset(10, 10), Position = UDim2.new(1, -16, 0.5, -5), BackgroundColor3 = C.OFF, BorderSizePixel = 0 }, btn)
+	corner(led, UDim.new(1, 0))
+	local bs = create("UIScale", { Scale = 1 }, btn)
+	btn.MouseButton1Down:Connect(function() tw(bs, 0.08, { Scale = 0.94 }) end)
+	btn.MouseButton1Up:Connect(function() tw(bs, 0.1, { Scale = 1 }) end)
+	btn.MouseLeave:Connect(function() tw(bs, 0.1, { Scale = 1 }) end)
+	btn.Activated:Connect(function() onEquipPressed(e.id) end)
+	equipButtons[e.id] = { btn = btn, led = led, stroke = st }
+end
+
+local statusLbl = create("TextLabel", {
+	Size = UDim2.new(1, -16, 0, 34), Position = UDim2.fromOffset(8, 158), BackgroundTransparency = 1,
+	Text = "Nenhum equipamento ativo", TextColor3 = C.LIT, Font = Enum.Font.Gotham, TextSize = 12,
+	TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top,
+}, body)
+
+local btnReset = create("TextButton", {
+	Size = UDim2.new(1, -16, 0, 28), Position = UDim2.fromOffset(8, 194), BackgroundColor3 = C.DARK,
+	Text = "⏻ DESLIGAR TUDO", TextColor3 = C.YEL, Font = Enum.Font.GothamBold, TextSize = 12, AutoButtonColor = false,
+}, body)
+corner(btnReset, UDim.new(0, 8))
+stroke(btnReset, C.YEL, 1)
+
+-- animações de abrir / fechar / minimizar
+local panelOpen, minimized = false, false
+local function placePanelFirstTime()
+	local x = fab.AbsolutePosition.X - PANEL_W * uiBase - 10
+	local y = fab.AbsolutePosition.Y - 10
+	local sz = gui.AbsoluteSize
+	x = clamp(x, 0, math.max(sz.X - PANEL_W * uiBase, 0))
+	y = clamp(y, 0, math.max(sz.Y - PANEL_H * uiBase, 0))
+	panel.Position = UDim2.fromOffset(x, y)
+end
+local placed = false
+
+local function openPanel(open)
+	panelOpen = open
+	if open then
+		if not placed then placed = true placePanelFirstTime() end
+		panel.Visible = true
+		panelScale.Scale = uiBase * 0.6
+		tw(panelScale, 0.22, { Scale = uiBase }, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+		tw(fabStroke, 0.2, { Thickness = 4 })
+	else
+		tw(panelScale, 0.16, { Scale = uiBase * 0.6 }, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+		tw(fabStroke, 0.2, { Thickness = 2.5 })
+		task.delay(0.17, function()
+			if not panelOpen then panel.Visible = false end
+		end)
+	end
+end
+
+local function setMinimized(m)
+	minimized = m
+	if m then
+		tw(panel, 0.2, { Size = UDim2.fromOffset(PANEL_W, TITLE_H) })
+		task.delay(0.2, function() if minimized then body.Visible = false end end)
+		btnMin.Text = "▢"
+	else
+		body.Visible = true
+		tw(panel, 0.2, { Size = UDim2.fromOffset(PANEL_W, PANEL_H) })
+		btnMin.Text = "—"
+	end
+end
+
+makeDraggable(fab, fab, function() playSound(CONFIG.Sounds.Click, 0.4) openPanel(not panelOpen) end)
+makeDraggable(titleBar, panel, nil)
+btnClose.Activated:Connect(function() openPanel(false) end)
+btnMin.Activated:Connect(function() setMinimized(not minimized) end)
+btnReset.Activated:Connect(function()
+	if State.tool then selectTool(State.tool) end -- alterna para nenhum
+	if State.glide then Glide.stop() end
+	setCape(false)
+	setGPS(false)
+	setNV(false)
+	Gel.clear()
+	refreshUI()
+end)
+
+-- botões de ação (grandes, arrastáveis)
+local function makeActionButton(size, pos)
+	local b = create("TextButton", {
+		Size = UDim2.fromOffset(size, size), Position = pos, BackgroundColor3 = C.BLK,
+		Text = "", AutoButtonColor = false, Visible = false,
+	}, gui)
+	corner(b, UDim.new(1, 0))
+	local st = stroke(b, C.YEL, 3)
+	local icon = create("TextLabel", {
+		Size = UDim2.new(1, 0, 0.58, 0), Position = UDim2.fromOffset(0, size * 0.08), BackgroundTransparency = 1,
+		Text = "", TextSize = size * 0.38, Font = Enum.Font.GothamBold, TextColor3 = C.YEL,
+	}, b)
+	local lbl = create("TextLabel", {
+		Size = UDim2.new(1, 0, 0.28, 0), Position = UDim2.new(0, 0, 0.62, 0), BackgroundTransparency = 1,
+		Text = "", TextSize = math.max(10, size * 0.14), Font = Enum.Font.GothamBlack, TextColor3 = C.LIT,
+	}, b)
+	create("UIScale", { Scale = uiBase }, b)
+	return b, icon, lbl, st
+end
+
+local actBtn, actIcon, actLbl, actStroke = makeActionButton(78, UDim2.new(1, -210, 1, -140))
+local act2Btn, act2Icon, act2Lbl = makeActionButton(58, UDim2.new(1, -200, 1, -208))
+makeDraggable(actBtn, actBtn, primaryAction)
+makeDraggable(act2Btn, act2Btn, secondaryAction)
+
+flashAction = function(duration)
+	actStroke.Color = C.OFF
+	tw(actStroke, duration, { Color = C.YEL }, Enum.EasingStyle.Linear)
+end
+
+-- mira central
+local crosshair = create("Frame", { Name = "Crosshair", Size = UDim2.fromOffset(26, 26), AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), BackgroundTransparency = 1, Visible = false }, gui)
+create("Frame", { Size = UDim2.fromOffset(4, 4), AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), BackgroundColor3 = C.YEL, BorderSizePixel = 0 }, crosshair)
+local ringF = create("Frame", { Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1 }, crosshair)
+corner(ringF, UDim.new(1, 0))
+stroke(ringF, C.YEL, 1.5)
+
+-- aviso (toast)
+local toastLabel = create("TextLabel", {
+	Size = UDim2.fromOffset(0, 30), AutomaticSize = Enum.AutomaticSize.X, AnchorPoint = Vector2.new(0.5, 0),
+	Position = UDim2.new(0.5, 0, 0, 62), BackgroundColor3 = C.BLK, BackgroundTransparency = 1, TextTransparency = 1,
+	Text = "", TextColor3 = C.YEL, Font = Enum.Font.GothamBold, TextSize = 14, Visible = false,
+}, gui)
+corner(toastLabel, UDim.new(0, 8))
+stroke(toastLabel, C.YEL, 1)
+create("UIPadding", { PaddingLeft = UDim.new(0, 12), PaddingRight = UDim.new(0, 12) }, toastLabel)
+local toastToken = 0
+toast = function(msg)
+	toastToken = toastToken + 1
+	local my = toastToken
+	toastLabel.Text = msg
+	toastLabel.Visible = true
+	toastLabel.TextTransparency = 1
+	toastLabel.BackgroundTransparency = 1
+	tw(toastLabel, 0.15, { TextTransparency = 0, BackgroundTransparency = 0.15 })
+	task.delay(1.8, function()
+		if my == toastToken then
+			tw(toastLabel, 0.3, { TextTransparency = 1, BackgroundTransparency = 1 })
+		end
+	end)
+end
+
+-- HUD do GPS
+do
+	local RADAR = 140
+	local frame = create("Frame", {
+		Name = "GPS", Size = UDim2.fromOffset(176, 232), Position = UDim2.fromOffset(12, 70),
+		BackgroundColor3 = C.BLK, BackgroundTransparency = 0.12, BorderSizePixel = 0, Visible = false, Active = true,
+	}, gui)
+	corner(frame, UDim.new(0, 10))
+	stroke(frame, C.YEL, 1.5)
+	create("UIScale", { Scale = uiBase * 0.9 }, frame)
+	create("TextLabel", {
+		Size = UDim2.new(1, -12, 0, 20), Position = UDim2.fromOffset(8, 2), BackgroundTransparency = 1,
+		Text = "📡 GPS TÁTICO", TextColor3 = C.YEL, Font = Enum.Font.GothamBlack, TextSize = 13,
+		TextXAlignment = Enum.TextXAlignment.Left,
+	}, frame)
+	local radar = create("Frame", { Size = UDim2.fromOffset(RADAR, RADAR), Position = UDim2.new(0.5, -RADAR / 2, 0, 24), BackgroundColor3 = C.DARK, BorderSizePixel = 0 }, frame)
+	corner(radar, UDim.new(1, 0))
+	stroke(radar, C.YEL, 1.5)
+	local mid = create("Frame", { Size = UDim2.fromScale(0.5, 0.5), Position = UDim2.fromScale(0.25, 0.25), BackgroundTransparency = 1 }, radar)
+	corner(mid, UDim.new(1, 0))
+	stroke(mid, C.LINE, 1)
+	create("Frame", { Size = UDim2.new(1, 0, 0, 1), Position = UDim2.fromScale(0, 0.5), BackgroundColor3 = C.LINE, BorderSizePixel = 0 }, radar)
+	create("Frame", { Size = UDim2.new(0, 1, 1, 0), Position = UDim2.fromScale(0.5, 0), BackgroundColor3 = C.LINE, BorderSizePixel = 0 }, radar)
+	local me = create("Frame", { Size = UDim2.fromOffset(8, 8), Position = UDim2.new(0.5, -4, 0.5, -4), BackgroundColor3 = C.YEL, BorderSizePixel = 0, Rotation = 45 }, radar)
+	create("TextLabel", { Size = UDim2.fromOffset(12, 12), Position = UDim2.new(0.5, -6, 0, 2), BackgroundTransparency = 1, Text = "▲", TextColor3 = C.YEL, TextSize = 10, Font = Enum.Font.GothamBold }, radar)
+	local dots = {}
+	for i = 1, 14 do
+		local d = create("Frame", { Size = UDim2.fromOffset(8, 8), BackgroundColor3 = C.LIT, BorderSizePixel = 0, Visible = false }, radar)
+		corner(d, UDim.new(1, 0))
+		dots[i] = d
+	end
+	local coords = create("TextLabel", {
+		Size = UDim2.new(1, -8, 0, 14), Position = UDim2.fromOffset(4, 168), BackgroundTransparency = 1,
+		Text = "", TextColor3 = C.LIT, Font = Enum.Font.Code, TextSize = 11,
+	}, frame)
+	local heading = create("TextLabel", {
+		Size = UDim2.new(1, -8, 0, 14), Position = UDim2.fromOffset(4, 182), BackgroundTransparency = 1,
+		Text = "", TextColor3 = C.YEL, Font = Enum.Font.Code, TextSize = 11,
+	}, frame)
+	local list = create("TextLabel", {
+		Size = UDim2.new(1, -12, 0, 40), Position = UDim2.fromOffset(6, 196), BackgroundTransparency = 1,
+		Text = "", TextColor3 = C.LIT, Font = Enum.Font.Gotham, TextSize = 11, TextWrapped = true,
+		TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top,
+	}, frame)
+	GPS.ui = { frame = frame, dots = dots, coords = coords, heading = heading, list = list, radarSize = RADAR }
+	makeDraggable(frame, frame, nil)
+end
+
+-- overlay da visão noturna
+do
+	local ov = create("Frame", { Name = "NVOverlay", Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Visible = false, Active = false, ZIndex = 0 }, gui)
+	local function edge(size, pos, rot)
+		local f = create("Frame", { Size = size, Position = pos, BackgroundColor3 = Color3.fromRGB(0, 15, 0), BorderSizePixel = 0, Active = false }, ov)
+		create("UIGradient", { Rotation = rot, Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.35), NumberSequenceKeypoint.new(1, 1) }) }, f)
+	end
+	edge(UDim2.new(1, 0, 0.18, 0), UDim2.fromScale(0, 0), 90)
+	edge(UDim2.new(1, 0, 0.18, 0), UDim2.fromScale(0, 0.82), 270)
+	edge(UDim2.new(0.12, 0, 1, 0), UDim2.fromScale(0, 0), 0)
+	edge(UDim2.new(0.12, 0, 1, 0), UDim2.fromScale(0.88, 0), 180)
+	create("TextLabel", {
+		Size = UDim2.fromOffset(200, 18), AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, 38),
+		BackgroundTransparency = 1, Text = "◉ VISÃO NOTURNA ATIVA", TextColor3 = Color3.fromRGB(150, 255, 170),
+		Font = Enum.Font.Code, TextSize = 12, Active = false,
+	}, ov)
+	NV.overlay = ov
+end
+
+-- atualização geral da interface
+refreshUI = function()
+	local names = {}
+	for _, e in ipairs(EQUIP) do
+		local b = equipButtons[e.id]
+		local on = isActive(e.id)
+		b.led.BackgroundColor3 = on and C.YEL or C.OFF
+		tw(b.btn, 0.15, { BackgroundColor3 = on and C.ON_BG or C.MID })
+		b.stroke.Color = on and C.YEL or C.LINE
+		if on then table.insert(names, e.name) end
+	end
+	if State.glide then table.insert(names, "PLANANDO") end
+	statusLbl.Text = (#names > 0) and ("ATIVO: " .. table.concat(names, "  •  ")) or "Nenhum equipamento ativo"
+
+	-- botão principal
+	local show = State.tool ~= nil or State.cape
+	actBtn.Visible = show
+	if State.tool == "hook" then actIcon.Text, actLbl.Text = "⚓", "GANCHO"
+	elseif State.tool == "batarang" then actIcon.Text, actLbl.Text = "🦇", "LANÇAR"
+	elseif State.tool == "gel" then actIcon.Text, actLbl.Text = "💥", "APLICAR"
+	elseif State.glide then actIcon.Text, actLbl.Text = "🧣", "SOLTAR"
+	else actIcon.Text, actLbl.Text = "🧣", "PLANAR" end
+
+	-- botão secundário
+	if State.tool == "gel" and #Gel.list > 0 then
+		act2Btn.Visible = true
+		act2Icon.Text, act2Lbl.Text = "🔴", "DETONAR"
+	elseif State.cape and State.tool then
+		act2Btn.Visible = true
+		act2Icon.Text, act2Lbl.Text = "🧣", "PLANAR"
+	else
+		act2Btn.Visible = false
+	end
+	crosshair.Visible = State.tool ~= nil
+end
+
+-- redimensionamento de tela
+local function onViewport()
+	uiBase = uiBaseScale()
+	fabScale.Scale = uiBase
+	if panelOpen then panelScale.Scale = uiBase end
+end
+local function hookViewport()
+	local cam = Workspace.CurrentCamera
+	if cam then cam:GetPropertyChangedSignal("ViewportSize"):Connect(onViewport) end
+end
+hookViewport()
+
+-- restaura a iluminação se a interface for destruída
+gui.Destroying:Connect(function()
+	if State.nv then
+		State.nv = false
+		NV.disable()
+	end
+end)
+
+------------------------------------------------------------------------
+-- ENTRADAS (teclado e pulo duplo)
+------------------------------------------------------------------------
+UserInputService.InputBegan:Connect(function(input, gp)
+	if gp then return end
+	local k = input.KeyCode
+	if k == Enum.KeyCode.E then primaryAction()
+	elseif k == Enum.KeyCode.Q then secondaryAction()
+	elseif k == Enum.KeyCode.One then onEquipPressed("cape")
+	elseif k == Enum.KeyCode.Two then onEquipPressed("hook")
+	elseif k == Enum.KeyCode.Three then onEquipPressed("batarang")
+	elseif k == Enum.KeyCode.Four then onEquipPressed("gps")
+	elseif k == Enum.KeyCode.Five then onEquipPressed("nv")
+	elseif k == Enum.KeyCode.Six then onEquipPressed("gel")
+	end
+end)
+
+UserInputService.JumpRequest:Connect(function()
+	if not Rig.alive or not Rig.hum then return end
+	if State.glide then
+		-- pular durante o planeio solta a capa
+		if os.clock() - (State.glideStart or 0) > 0.5 then Glide.stop() end
+		return
+	end
+	if CONFIG.GlideOnDoubleJump and State.cape and Rig.hum.FloorMaterial == Enum.Material.Air and os.clock() - State.airStart > 0.2 then
+		Glide.start()
+	end
+end)
+
+------------------------------------------------------------------------
+-- CICLO DE VIDA DO PERSONAGEM
+------------------------------------------------------------------------
+local function teardownCharacter()
+	Glide.stop(true)
+	Anim.cancel()
+	Tools.hide()
+	Tools.hideDetonator()
+	Cable.hide()
+	Gel.clear()
+	Cape.destroy(true)
+	if Rig.alive then Anim.hardReset() end
+	Rig.alive = false
+	State.tool = nil
+	State.busy = false
+	State.glide = false
+	refreshUI()
+end
+
+local function setupCharacter(char)
+	teardownCharacter()
+	local hum = char:WaitForChild("Humanoid", 10)
+	local hrp = char:WaitForChild("HumanoidRootPart", 10)
+	if not hum or not hrp then return end
+	local t0 = os.clock()
+	local ok = false
+	repeat
+		ok = indexRig(char)
+		if ok then break end
+		task.wait(0.1)
+	until os.clock() - t0 > 6
+	if not ok then
+		toast("Rig incompatível com o sistema")
+		return
+	end
+	Rig.char, Rig.hum, Rig.hrp = char, hum, hrp
+	Rig.r15 = hum.RigType == Enum.HumanoidRigType.R15
+	Rig.torso = char:FindFirstChild("UpperTorso") or char:FindFirstChild("Torso")
+	Rig.rHand = char:FindFirstChild("RightHand") or char:FindFirstChild("Right Arm")
+	Rig.lHand = char:FindFirstChild("LeftHand") or char:FindFirstChild("Left Arm")
+	Rig.alive = true
+	State.airStart = 0
+
+	hum.Died:Connect(function()
+		if Rig.char == char then teardownCharacter() end
+	end)
+	char.AncestryChanged:Connect(function(_, parent)
+		if not parent and Rig.char == char then teardownCharacter() end
+	end)
+	hum.StateChanged:Connect(function(_, new)
+		if new == Enum.HumanoidStateType.Freefall or new == Enum.HumanoidStateType.Jumping then
+			if os.clock() - State.airStart > 0.3 or State.airStart == 0 then State.airStart = os.clock() end
+		end
+	end)
+
+	if State.cape then Cape.build() end
+	refreshUI()
+end
+
+player.CharacterAdded:Connect(function(char) task.spawn(setupCharacter, char) end)
+if player.Character then task.spawn(setupCharacter, player.Character) end
+
+-- Servidor opcional (explosão visível para os outros + peças quebráveis)
+task.spawn(function()
+	local ev = ReplicatedStorage:WaitForChild("BatmanTacticalEvents", 5)
+	if ev and ev:IsA("RemoteEvent") then
+		GelEvents = ev
+		ev.OnClientEvent:Connect(function(kind, pos)
+			if kind == "GelFX" and typeof(pos) == "Vector3" then boom(pos, true) end
+		end)
+	end
+end)
+
+refreshUI()
