@@ -151,6 +151,11 @@ local toast = function(_) end
 local refreshUI = function() end
 local flashAction = function(_) end
 
+local function reportError(where, err)
+	warn("[BatmanTacticalSystem] " .. where .. ": " .. tostring(err))
+	toast("⚠ " .. where .. ": " .. string.sub(tostring(err), 1, 90))
+end
+
 ------------------------------------------------------------------------
 -- RIG (articulações originais guardadas e restauradas)
 ------------------------------------------------------------------------
@@ -273,7 +278,7 @@ local function runJob(fn)
 	State.busy = true
 	task.spawn(function()
 		local ok, err = pcall(fn, token)
-		if not ok then warn("[BatmanTacticalSystem] " .. tostring(err)) end
+		if not ok then reportError("ação", err) end
 		if token == Anim.token then State.busy = false end
 	end)
 end
@@ -627,7 +632,14 @@ function Cape.build()
 	Cape.clasp = newPart({ Name = "Clasp", Anchored = true, Size = Vector3.new(0.45, 0.2, 0.12), Color = C.YEL, Material = Enum.Material.Metal, Transparency = 1 })
 	Cape.clasp.Parent = folder
 	tw(Cape.clasp, 0.35, { Transparency = 0 })
-	RunService:BindToRenderStep("BTS_Cape", Enum.RenderPriority.Character.Value + 1, Cape.step)
+	local shown = false
+	RunService:BindToRenderStep("BTS_Cape", Enum.RenderPriority.Character.Value + 1, function(dt)
+		local ok, err = pcall(Cape.step, dt)
+		if not ok and not shown then
+			shown = true
+			reportError("capa", err)
+		end
+	end)
 end
 
 ------------------------------------------------------------------------
@@ -738,7 +750,9 @@ function Glide.step(dt, st)
 
 	-- velocidade: olhar para baixo mergulha, para cima segura a queda
 	local tgtSpeed = clamp(52 + (-cl.Y) * 34 + fwd * 12, 34, 92)
-	local tgtVy = -clamp(13 - cl.Y * 45, 5, 52)
+	local tgtVy = -clamp(8 - cl.Y * 40, 3, 48)
+	local sinceStart = os.clock() - st.t0
+	if sinceStart < 0.6 then tgtVy = math.max(tgtVy, 16 * (1 - sinceStart / 0.6)) end
 	st.speed = lerp(st.speed, tgtSpeed, 1 - math.exp(-2 * dt))
 	st.vy = lerp(st.vy, tgtVy, 1 - math.exp(-2.5 * dt))
 	Glide.lv.VectorVelocity = h * st.speed + Vector3.new(0, st.vy, 0)
@@ -754,7 +768,7 @@ function Glide.step(dt, st)
 	end
 
 	local elapsed = os.clock() - st.t0
-	if elapsed > 0.45 then
+	if elapsed > 0.9 then
 		-- pouso
 		local res = Workspace:Raycast(pos, Vector3.new(0, -5, 0), Glide.params)
 		if res then Glide.stop() return end
@@ -811,7 +825,13 @@ function Glide.start()
 		vy = vel0.Y, bank = 0, lean = 52, t0 = os.clock(), entry = os.clock() + 0.34,
 		stall = 0, last = hrp.Position,
 	}
-	Glide.conn = RunService.Heartbeat:Connect(function(dt) Glide.step(dt, st) end)
+	Glide.conn = RunService.Heartbeat:Connect(function(dt)
+		local ok, err = pcall(Glide.step, dt, st)
+		if not ok then
+			reportError("planeio", err)
+			Glide.stop(true)
+		end
+	end)
 	refreshUI()
 end
 
@@ -1287,7 +1307,7 @@ local function selectTool(name)
 				Anim.step(token, {}, 0.2)
 			end
 		end)
-		if not ok then warn("[BatmanTacticalSystem] " .. tostring(err)) end
+		if not ok then reportError("ação", err) end
 		if token == Anim.token then State.busy = false end
 	end)
 end
@@ -1377,12 +1397,15 @@ local function makeDraggable(handle, target, onTap)
 			dragging, active, moved = true, input, false
 			startIn = input.Position
 			startPos = target.AbsolutePosition
-			input.Changed:Connect(function()
-				if input.UserInputState == Enum.UserInputState.End then
-					if dragging and active == input and not moved and onTap then onTap() end
-					if active == input then dragging = false end
-				end
-			end)
+		end
+	end)
+	UserInputService.InputEnded:Connect(function(input)
+		if dragging and active == input then
+			dragging = false
+			if not moved and onTap then
+				local ok, err = pcall(onTap)
+				if not ok then reportError("toque", err) end
+			end
 		end
 	end)
 	UserInputService.InputChanged:Connect(function(input)
@@ -1770,7 +1793,7 @@ UserInputService.JumpRequest:Connect(function()
 	if not Rig.alive or not Rig.hum then return end
 	if State.glide then
 		-- pular durante o planeio solta a capa
-		if os.clock() - (State.glideStart or 0) > 0.5 then Glide.stop() end
+		if os.clock() - (State.glideStart or 0) > 1.0 then Glide.stop() end
 		return
 	end
 	if CONFIG.GlideOnDoubleJump and State.cape and Rig.hum.FloorMaterial == Enum.Material.Air and os.clock() - State.airStart > 0.2 then
@@ -1835,10 +1858,16 @@ local function setupCharacter(char)
 
 	if State.cape then Cape.build() end
 	refreshUI()
+	toast(Rig.r15 and "🦇 Sistema pronto (R15)" or "🦇 Sistema pronto (R6)")
 end
 
-player.CharacterAdded:Connect(function(char) task.spawn(setupCharacter, char) end)
-if player.Character then task.spawn(setupCharacter, player.Character) end
+local function safeSetup(char)
+	local ok, err = pcall(setupCharacter, char)
+	if not ok then reportError("inicialização", err) end
+end
+
+player.CharacterAdded:Connect(function(char) task.spawn(safeSetup, char) end)
+if player.Character then task.spawn(safeSetup, player.Character) end
 
 -- Servidor opcional (explosão visível para os outros + peças quebráveis)
 task.spawn(function()
