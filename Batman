@@ -171,7 +171,7 @@ local JOINT_NAMES = {
 	LE = { "LeftElbow" },
 	WA = { "Waist" },
 	NK = { "Neck" },
-	RJ = { "RootJoint" },
+	RJ = { "RootJoint", "Root" }, -- R6 = RootJoint, R15 = Root
 }
 
 local function offsetC0(orig, off)
@@ -179,7 +179,7 @@ local function offsetC0(orig, off)
 	return CFrame.new(orig.Position) * off * orig.Rotation
 end
 
-local function indexRig(char)
+local function indexRig(char, hrp)
 	local joints, orig = {}, {}
 	for key, names in pairs(JOINT_NAMES) do
 		for _, n in ipairs(names) do
@@ -191,9 +191,19 @@ local function indexRig(char)
 			end
 		end
 	end
+	-- fallback: qualquer Motor6D ligado direto ao HumanoidRootPart é a raiz
+	if not joints.RJ and hrp then
+		for _, d in ipairs(char:GetDescendants()) do
+			if d:IsA("Motor6D") and d.Part0 == hrp then
+				joints.RJ = d
+				orig[d] = d.C0
+				break
+			end
+		end
+	end
 	if not joints.WA and joints.RJ then joints.WA = joints.RJ end -- R6: cintura = raiz
 	Rig.joints, Rig.orig = joints, orig
-	return joints.RS ~= nil and joints.LS ~= nil and joints.RJ ~= nil
+	return joints.RJ ~= nil and joints.RS ~= nil and joints.LS ~= nil
 end
 
 local function rayParams()
@@ -752,7 +762,7 @@ function Glide.step(dt, st)
 	local tgtSpeed = clamp(52 + (-cl.Y) * 34 + fwd * 12, 34, 92)
 	local tgtVy = -clamp(8 - cl.Y * 40, 3, 48)
 	local sinceStart = os.clock() - st.t0
-	if sinceStart < 0.6 then tgtVy = math.max(tgtVy, 16 * (1 - sinceStart / 0.6)) end
+	if sinceStart < 1.3 then tgtVy = math.max(tgtVy, 24 * (1 - sinceStart / 1.3)) end -- impulso de saída
 	st.speed = lerp(st.speed, tgtSpeed, 1 - math.exp(-2 * dt))
 	st.vy = lerp(st.vy, tgtVy, 1 - math.exp(-2.5 * dt))
 	Glide.lv.VectorVelocity = h * st.speed + Vector3.new(0, st.vy, 0)
@@ -768,7 +778,7 @@ function Glide.step(dt, st)
 	end
 
 	local elapsed = os.clock() - st.t0
-	if elapsed > 0.9 then
+	if elapsed > 1.3 then
 		-- pouso
 		local res = Workspace:Raycast(pos, Vector3.new(0, -5, 0), Glide.params)
 		if res then Glide.stop() return end
@@ -1828,17 +1838,21 @@ local function setupCharacter(char)
 	local t0 = os.clock()
 	local ok = false
 	repeat
-		ok = indexRig(char)
+		ok = indexRig(char, hrp)
 		if ok then break end
 		task.wait(0.1)
-	until os.clock() - t0 > 6
+	until os.clock() - t0 > 4
 	if not ok then
-		toast("Rig incompatível com o sistema")
-		return
+		-- segue mesmo assim (ferramentas, GPS, visão noturna etc. funcionam); só avisa o que faltou
+		local missing = {}
+		for _, k in ipairs({ "RJ", "RS", "LS" }) do
+			if not Rig.joints[k] then table.insert(missing, k) end
+		end
+		toast("Rig parcial — falta: " .. table.concat(missing, ","))
 	end
 	Rig.char, Rig.hum, Rig.hrp = char, hum, hrp
 	Rig.r15 = hum.RigType == Enum.HumanoidRigType.R15
-	Rig.torso = char:FindFirstChild("UpperTorso") or char:FindFirstChild("Torso")
+	Rig.torso = char:FindFirstChild("UpperTorso") or char:FindFirstChild("Torso") or hrp
 	Rig.rHand = char:FindFirstChild("RightHand") or char:FindFirstChild("Right Arm")
 	Rig.lHand = char:FindFirstChild("LeftHand") or char:FindFirstChild("Left Arm")
 	Rig.alive = true
@@ -1858,7 +1872,7 @@ local function setupCharacter(char)
 
 	if State.cape then Cape.build() end
 	refreshUI()
-	toast(Rig.r15 and "🦇 Sistema pronto (R15)" or "🦇 Sistema pronto (R6)")
+	if ok then toast(Rig.r15 and "🦇 Sistema pronto (R15)" or "🦇 Sistema pronto (R6)") end
 end
 
 local function safeSetup(char)
